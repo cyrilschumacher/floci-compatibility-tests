@@ -105,7 +105,8 @@ public class FlociTest {
                 new StepFunctionsTests(),
                 new StepFunctionsJsonataTests(),
                 new StepFunctionsDynamoDbTests(),
-                new SesTests()
+                new SesTests(),
+                new ApiGatewayAwsIntegrationTests()
         );
 
         Set<String> enabled = resolveEnabled(args);
