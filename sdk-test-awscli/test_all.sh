@@ -55,6 +55,11 @@ run_if() {
     fi
 }
 
+ddb_wait_table() {
+    local table_name="$1"
+    aws_cmd dynamodb wait table-exists --table-name "$table_name" >/dev/null 2>&1
+}
+
 # ---------------------------------------------------------------------------
 # SSM
 # ---------------------------------------------------------------------------
@@ -549,14 +554,19 @@ run_dynamodb_scan_filter() {
 
     # ---- Test 1: Scan with contains() on List attribute ----
     local t1="cli-scan-contains-list"
-    aws_cmd dynamodb create-table --table-name "$t1" \
+    out=$(aws_cmd dynamodb create-table --table-name "$t1" \
         --attribute-definitions AttributeName=id,AttributeType=S \
         --key-schema AttributeName=id,KeyType=HASH \
-        --billing-mode PAY_PER_REQUEST >/dev/null 2>&1
+        --billing-mode PAY_PER_REQUEST 2>&1) && rc=0 || rc=1
+    check "DDB Scan filter table create (list)" "$( [ $rc -eq 0 ] && echo true || echo false )" "$out"
+    ddb_wait_table "$t1"
 
-    aws_cmd dynamodb put-item --table-name "$t1" --item '{"id":{"S":"1"},"tags":{"L":[{"S":"a"},{"S":"b"}]}}' >/dev/null 2>&1
-    aws_cmd dynamodb put-item --table-name "$t1" --item '{"id":{"S":"2"},"tags":{"L":[{"S":"a"},{"S":"c"}]}}' >/dev/null 2>&1
-    aws_cmd dynamodb put-item --table-name "$t1" --item '{"id":{"S":"3"},"tags":{"L":[{"S":"b"},{"S":"c"}]}}' >/dev/null 2>&1
+    out=$(aws_cmd dynamodb put-item --table-name "$t1" --item '{"id":{"S":"1"},"tags":{"L":[{"S":"a"},{"S":"b"}]}}' 2>&1) && rc=0 || rc=1
+    check "DDB Seed list item 1" "$( [ $rc -eq 0 ] && echo true || echo false )" "$out"
+    out=$(aws_cmd dynamodb put-item --table-name "$t1" --item '{"id":{"S":"2"},"tags":{"L":[{"S":"a"},{"S":"c"}]}}' 2>&1) && rc=0 || rc=1
+    check "DDB Seed list item 2" "$( [ $rc -eq 0 ] && echo true || echo false )" "$out"
+    out=$(aws_cmd dynamodb put-item --table-name "$t1" --item '{"id":{"S":"3"},"tags":{"L":[{"S":"b"},{"S":"c"}]}}' 2>&1) && rc=0 || rc=1
+    check "DDB Seed list item 3" "$( [ $rc -eq 0 ] && echo true || echo false )" "$out"
 
     out=$(aws_cmd dynamodb scan --table-name "$t1" \
         --filter-expression "contains(tags, :v)" \
@@ -568,14 +578,19 @@ run_dynamodb_scan_filter() {
 
     # ---- Test 2: Scan with <> on BOOL attribute ----
     local t2="cli-scan-bool-ne"
-    aws_cmd dynamodb create-table --table-name "$t2" \
+    out=$(aws_cmd dynamodb create-table --table-name "$t2" \
         --attribute-definitions AttributeName=id,AttributeType=S \
         --key-schema AttributeName=id,KeyType=HASH \
-        --billing-mode PAY_PER_REQUEST >/dev/null 2>&1
+        --billing-mode PAY_PER_REQUEST 2>&1) && rc=0 || rc=1
+    check "DDB Scan filter table create (bool)" "$( [ $rc -eq 0 ] && echo true || echo false )" "$out"
+    ddb_wait_table "$t2"
 
-    aws_cmd dynamodb put-item --table-name "$t2" --item '{"id":{"S":"1"},"deleted":{"BOOL":false}}' >/dev/null 2>&1
-    aws_cmd dynamodb put-item --table-name "$t2" --item '{"id":{"S":"2"},"deleted":{"BOOL":true}}' >/dev/null 2>&1
-    aws_cmd dynamodb put-item --table-name "$t2" --item '{"id":{"S":"3"},"deleted":{"BOOL":false}}' >/dev/null 2>&1
+    out=$(aws_cmd dynamodb put-item --table-name "$t2" --item '{"id":{"S":"1"},"deleted":{"BOOL":false}}' 2>&1) && rc=0 || rc=1
+    check "DDB Seed bool item 1" "$( [ $rc -eq 0 ] && echo true || echo false )" "$out"
+    out=$(aws_cmd dynamodb put-item --table-name "$t2" --item '{"id":{"S":"2"},"deleted":{"BOOL":true}}' 2>&1) && rc=0 || rc=1
+    check "DDB Seed bool item 2" "$( [ $rc -eq 0 ] && echo true || echo false )" "$out"
+    out=$(aws_cmd dynamodb put-item --table-name "$t2" --item '{"id":{"S":"3"},"deleted":{"BOOL":false}}' 2>&1) && rc=0 || rc=1
+    check "DDB Seed bool item 3" "$( [ $rc -eq 0 ] && echo true || echo false )" "$out"
 
     out=$(aws_cmd dynamodb scan --table-name "$t2" \
         --filter-expression "deleted <> :d" \
@@ -587,20 +602,25 @@ run_dynamodb_scan_filter() {
 
     # ---- Test 3: Query on GSI with <> on BOOL attribute ----
     local t3="cli-query-gsi-bool-ne"
-    aws_cmd dynamodb create-table --table-name "$t3" \
+    out=$(aws_cmd dynamodb create-table --table-name "$t3" \
         --attribute-definitions 'AttributeName=id,AttributeType=S' 'AttributeName=grp,AttributeType=S' \
         --key-schema AttributeName=id,KeyType=HASH \
         --global-secondary-indexes \
             'IndexName=grp-idx,KeySchema=[{AttributeName=grp,KeyType=HASH}],Projection={ProjectionType=ALL}' \
-        --billing-mode PAY_PER_REQUEST >/dev/null 2>&1
+        --billing-mode PAY_PER_REQUEST 2>&1) && rc=0 || rc=1
+    check "DDB Scan filter table create (gsi)" "$( [ $rc -eq 0 ] && echo true || echo false )" "$out"
+    ddb_wait_table "$t3"
 
-    aws_cmd dynamodb put-item --table-name "$t3" --item '{"id":{"S":"1"},"grp":{"S":"g1"},"deleted":{"BOOL":false}}' >/dev/null 2>&1
-    aws_cmd dynamodb put-item --table-name "$t3" --item '{"id":{"S":"2"},"grp":{"S":"g1"},"deleted":{"BOOL":true}}' >/dev/null 2>&1
-    aws_cmd dynamodb put-item --table-name "$t3" --item '{"id":{"S":"3"},"grp":{"S":"g1"},"deleted":{"BOOL":false}}' >/dev/null 2>&1
+    out=$(aws_cmd dynamodb put-item --table-name "$t3" --item '{"id":{"S":"1"},"grp":{"S":"g1"},"deleted":{"BOOL":false}}' 2>&1) && rc=0 || rc=1
+    check "DDB Seed GSI item 1" "$( [ $rc -eq 0 ] && echo true || echo false )" "$out"
+    out=$(aws_cmd dynamodb put-item --table-name "$t3" --item '{"id":{"S":"2"},"grp":{"S":"g1"},"deleted":{"BOOL":true}}' 2>&1) && rc=0 || rc=1
+    check "DDB Seed GSI item 2" "$( [ $rc -eq 0 ] && echo true || echo false )" "$out"
+    out=$(aws_cmd dynamodb put-item --table-name "$t3" --item '{"id":{"S":"3"},"grp":{"S":"g1"},"deleted":{"BOOL":false}}' 2>&1) && rc=0 || rc=1
+    check "DDB Seed GSI item 3" "$( [ $rc -eq 0 ] && echo true || echo false )" "$out"
 
     out=$(aws_cmd dynamodb query --table-name "$t3" --index-name grp-idx \
         --key-condition-expression "grp = :g" \
-        --filter-expression "deleted <> :d" \
+        --filter-expression "#d <> :d" \
         --expression-attribute-names '{"#d":"deleted"}' \
         --expression-attribute-values '{":g":{"S":"g1"},":d":{"BOOL":true}}' 2>&1) && rc=0 || rc=1
     cnt=$(echo "$out" | python -c "import sys,json; print(json.load(sys.stdin).get('Count',0))" 2>/dev/null || echo 0)
@@ -610,14 +630,19 @@ run_dynamodb_scan_filter() {
 
     # ---- Test 4: Scan with attribute_exists on nested Map attribute ----
     local t4="cli-scan-nested-attr-exists"
-    aws_cmd dynamodb create-table --table-name "$t4" \
+    out=$(aws_cmd dynamodb create-table --table-name "$t4" \
         --attribute-definitions AttributeName=id,AttributeType=S \
         --key-schema AttributeName=id,KeyType=HASH \
-        --billing-mode PAY_PER_REQUEST >/dev/null 2>&1
+        --billing-mode PAY_PER_REQUEST 2>&1) && rc=0 || rc=1
+    check "DDB Scan filter table create (nested)" "$( [ $rc -eq 0 ] && echo true || echo false )" "$out"
+    ddb_wait_table "$t4"
 
-    aws_cmd dynamodb put-item --table-name "$t4" --item '{"id":{"S":"1"},"info":{"M":{"name":{"S":"Alice"}}}}' >/dev/null 2>&1
-    aws_cmd dynamodb put-item --table-name "$t4" --item '{"id":{"S":"2"},"info":{"M":{}}}' >/dev/null 2>&1
-    aws_cmd dynamodb put-item --table-name "$t4" --item '{"id":{"S":"3"},"info":{"M":{"name":{"S":"Bob"}}}}' >/dev/null 2>&1
+    out=$(aws_cmd dynamodb put-item --table-name "$t4" --item '{"id":{"S":"1"},"info":{"M":{"name":{"S":"Alice"}}}}' 2>&1) && rc=0 || rc=1
+    check "DDB Seed nested item 1" "$( [ $rc -eq 0 ] && echo true || echo false )" "$out"
+    out=$(aws_cmd dynamodb put-item --table-name "$t4" --item '{"id":{"S":"2"},"info":{"M":{}}}' 2>&1) && rc=0 || rc=1
+    check "DDB Seed nested item 2" "$( [ $rc -eq 0 ] && echo true || echo false )" "$out"
+    out=$(aws_cmd dynamodb put-item --table-name "$t4" --item '{"id":{"S":"3"},"info":{"M":{"name":{"S":"Bob"}}}}' 2>&1) && rc=0 || rc=1
+    check "DDB Seed nested item 3" "$( [ $rc -eq 0 ] && echo true || echo false )" "$out"
 
     out=$(aws_cmd dynamodb scan --table-name "$t4" \
         --filter-expression "attribute_exists(info.#n)" \
@@ -629,13 +654,17 @@ run_dynamodb_scan_filter() {
 
     # ---- Test 5: contains() on String Set (SS) ----
     local t5="cli-scan-contains-ss"
-    aws_cmd dynamodb create-table --table-name "$t5" \
+    out=$(aws_cmd dynamodb create-table --table-name "$t5" \
         --attribute-definitions AttributeName=id,AttributeType=S \
         --key-schema AttributeName=id,KeyType=HASH \
-        --billing-mode PAY_PER_REQUEST >/dev/null 2>&1
+        --billing-mode PAY_PER_REQUEST 2>&1) && rc=0 || rc=1
+    check "DDB Scan filter table create (ss)" "$( [ $rc -eq 0 ] && echo true || echo false )" "$out"
+    ddb_wait_table "$t5"
 
-    aws_cmd dynamodb put-item --table-name "$t5" --item '{"id":{"S":"1"},"roles":{"SS":["admin","user"]}}' >/dev/null 2>&1
-    aws_cmd dynamodb put-item --table-name "$t5" --item '{"id":{"S":"2"},"roles":{"SS":["user"]}}' >/dev/null 2>&1
+    out=$(aws_cmd dynamodb put-item --table-name "$t5" --item '{"id":{"S":"1"},"roles":{"SS":["admin","user"]}}' 2>&1) && rc=0 || rc=1
+    check "DDB Seed set item 1" "$( [ $rc -eq 0 ] && echo true || echo false )" "$out"
+    out=$(aws_cmd dynamodb put-item --table-name "$t5" --item '{"id":{"S":"2"},"roles":{"SS":["user"]}}' 2>&1) && rc=0 || rc=1
+    check "DDB Seed set item 2" "$( [ $rc -eq 0 ] && echo true || echo false )" "$out"
 
     out=$(aws_cmd dynamodb scan --table-name "$t5" \
         --filter-expression "contains(roles, :r)" \
