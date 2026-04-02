@@ -236,7 +236,9 @@ run_s3() {
 
     local non_ascii_key="src/テスト画像.png"
     local non_ascii_dst="dst/テスト画像.png"
-    out=$(aws_cmd s3api put-object --bucket "$bucket" --key "$non_ascii_key" --body /dev/stdin <<< "non-ascii content" 2>&1) && rc=0 || rc=1
+    local non_ascii_body=$(mktemp)
+    printf '%s' "non-ascii content" > "$non_ascii_body"
+    out=$(aws_cmd s3api put-object --bucket "$bucket" --key "$non_ascii_key" --body "$non_ascii_body" 2>&1) && rc=0 || rc=1
     if [ $rc -eq 0 ]; then
         out=$(aws_cmd s3api copy-object --bucket "$bucket" --copy-source "$bucket/$non_ascii_key" --key "$non_ascii_dst" 2>&1) && rc=0 || rc=1
         check "S3 CopyObject non-ASCII key" "$( [ $rc -eq 0 ] && echo true || echo false )" "$out"
@@ -245,6 +247,7 @@ run_s3() {
     else
         check "S3 CopyObject non-ASCII key" "false" "$out"
     fi
+    rm -f "$non_ascii_body"
 
     out=$(aws_cmd s3api copy-object \
         --bucket "$bucket" \
