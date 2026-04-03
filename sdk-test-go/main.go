@@ -13,6 +13,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"net/http"
 	"net/url"
 	"encoding/json"
 	"fmt"
@@ -147,7 +148,7 @@ func runSQS(cfg aws.Config) {
 	check("SQS ListQueues", err, err == nil && len(lr.QueueUrls) > 0)
 
 	ur, err := svc.GetQueueUrl(ctx, &sqs.GetQueueUrlInput{QueueName: aws.String(qName)})
-	check("SQS GetQueueUrl", err, err == nil && strings.Contains(aws.ToString(ur.QueueUrl), qName))
+	check("SQS GetQueueUrl", err, err == nil && aws.ToString(ur.QueueUrl) == qURL)
 
 	ar, err := svc.GetQueueAttributes(ctx, &sqs.GetQueueAttributesInput{
 		QueueUrl:       aws.String(qURL),
@@ -396,6 +397,228 @@ func runS3(cfg aws.Config) {
 	svc.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: aws.String(euBucket)})
 	_, err = svc.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: aws.String(bucket)})
 	check("S3 DeleteBucket", err)
+}
+
+func runS3Cors(cfg aws.Config) {
+	fmt.Println("--- S3 CORS Enforcement Tests ---")
+	svc := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		o.UsePathStyle = true
+	})
+	endpoint := os.Getenv("FLOCI_ENDPOINT")
+	if endpoint == "" {
+		endpoint = "http://localhost:4566"
+	}
+	baseURL := endpoint
+	bucket := fmt.Sprintf("go-cors-test-%d", time.Now().UnixMilli())
+	objectKey := "cors-test.txt"
+
+	// raw sends a raw HTTP request and returns the status code and response headers.
+	raw := func(method, path string, headers map[string]string) (int, http.Header, error) {
+		rawURL := baseURL + "/" + bucket + path
+		req, err := http.NewRequest(method, rawURL, nil)
+		if err != nil {
+			return 0, nil, err
+		}
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		client := &http.Client{
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return 0, nil, err
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode, resp.Header, nil
+	}
+
+	// ── Setup ─────────────────────────────────────────────────────────────────
+	_, err := svc.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)})
+	check("S3 CORS setup CreateBucket", err)
+	if err != nil {
+		return
+	}
+	_, err = svc.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      aws.String(bucket),
+		Key:         aws.String(objectKey),
+		Body:        strings.NewReader("hello cors"),
+		ContentType: aws.String("text/plain"),
+	})
+	check("S3 CORS setup PutObject", err)
+	if err != nil {
+		svc.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: aws.String(bucket)})
+		return
+	}
+
+	// ── No CORS config: preflight → 403 ──────────────────────────────────────
+	status, _, err := raw("OPTIONS", "/"+objectKey, map[string]string{
+		"Origin":                        "http://localhost:3000",
+		"Access-Control-Request-Method": "GET",
+	})
+	check("S3 CORS preflight without config → 403", err, err == nil && status == 403)
+
+	// ── Wildcard-origin CORS config ───────────────────────────────────────────
+	maxAge3000 := int32(3000)
+	_, err = svc.PutBucketCors(ctx, &s3.PutBucketCorsInput{
+		Bucket: aws.String(bucket),
+		CORSConfiguration: &s3types.CORSConfiguration{
+			CORSRules: []s3types.CORSRule{
+				{
+					AllowedOrigins: []string{"*"},
+					AllowedMethods: []string{"GET", "PUT", "POST", "DELETE", "HEAD"},
+					AllowedHeaders: []string{"*"},
+					ExposeHeaders:  []string{"ETag"},
+					MaxAgeSeconds:  &maxAge3000,
+				},
+			},
+		},
+	})
+	check("S3 CORS PutBucketCors (wildcard)", err)
+
+	status, hdrs, err := raw("OPTIONS", "/"+objectKey, map[string]string{
+		"Origin":                        "http://localhost:3000",
+		"Access-Control-Request-Method": "GET",
+	})
+	check("S3 CORS wildcard preflight → 200", err, err == nil && status == 200)
+	check("S3 CORS wildcard preflight → Allow-Origin: *", err,
+		err == nil && hdrs.Get("Access-Control-Allow-Origin") == "*")
+	check("S3 CORS wildcard preflight → Max-Age: 3000", err,
+		err == nil && hdrs.Get("Access-Control-Max-Age") == "3000")
+	check("S3 CORS wildcard preflight → Allow-Methods contains GET", err,
+		err == nil && strings.Contains(strings.ToUpper(hdrs.Get("Access-Control-Allow-Methods")), "GET"))
+
+	// Actual GET with Origin → receives CORS response headers
+	status, hdrs, err = raw("GET", "/"+objectKey, map[string]string{"Origin": "http://localhost:3000"})
+	check("S3 CORS actual GET → Allow-Origin: *", err,
+		err == nil && hdrs.Get("Access-Control-Allow-Origin") == "*")
+	varyHasOrigin := func(vary string) bool {
+		for _, tok := range strings.Split(vary, ",") {
+			if strings.EqualFold(strings.TrimSpace(tok), "origin") {
+				return true
+			}
+		}
+		return false
+	}
+	check("S3 CORS actual GET → Vary: Origin", err,
+		err == nil && varyHasOrigin(hdrs.Get("Vary")))
+	check("S3 CORS actual GET → Expose-Headers contains ETag", err,
+		err == nil && strings.Contains(hdrs.Get("Access-Control-Expose-Headers"), "ETag"))
+
+	// Actual GET without Origin → no CORS headers
+	_, hdrs, err = raw("GET", "/"+objectKey, nil)
+	check("S3 CORS actual GET (no Origin) → no Allow-Origin", err,
+		err == nil && hdrs.Get("Access-Control-Allow-Origin") == "")
+
+	// OPTIONS without Origin → no CORS headers
+	_, hdrs, err = raw("OPTIONS", "/"+objectKey, nil)
+	check("S3 CORS OPTIONS without Origin → no Allow-Origin", err,
+		err == nil && hdrs.Get("Access-Control-Allow-Origin") == "")
+
+	// ── Specific-origin CORS config ───────────────────────────────────────────
+	maxAge600 := int32(600)
+	_, err = svc.PutBucketCors(ctx, &s3.PutBucketCorsInput{
+		Bucket: aws.String(bucket),
+		CORSConfiguration: &s3types.CORSConfiguration{
+			CORSRules: []s3types.CORSRule{
+				{
+					AllowedOrigins: []string{"https://example.com"},
+					AllowedMethods: []string{"GET", "PUT"},
+					AllowedHeaders: []string{"Content-Type", "Authorization"},
+					ExposeHeaders:  []string{"ETag", "x-amz-request-id"},
+					MaxAgeSeconds:  &maxAge600,
+				},
+			},
+		},
+	})
+	check("S3 CORS PutBucketCors (specific origin)", err)
+
+	status, hdrs, err = raw("OPTIONS", "/"+objectKey, map[string]string{
+		"Origin":                         "https://example.com",
+		"Access-Control-Request-Method":  "GET",
+		"Access-Control-Request-Headers": "Content-Type",
+	})
+	check("S3 CORS specific origin preflight → 200", err, err == nil && status == 200)
+	check("S3 CORS specific origin preflight → echoes origin", err,
+		err == nil && hdrs.Get("Access-Control-Allow-Origin") == "https://example.com")
+	check("S3 CORS specific origin preflight → Max-Age: 600", err,
+		err == nil && hdrs.Get("Access-Control-Max-Age") == "600")
+
+	status, _, err = raw("OPTIONS", "/"+objectKey, map[string]string{
+		"Origin":                        "https://attacker.evil.com",
+		"Access-Control-Request-Method": "GET",
+	})
+	check("S3 CORS non-matching origin → 403", err, err == nil && status == 403)
+
+	status, _, err = raw("OPTIONS", "/"+objectKey, map[string]string{
+		"Origin":                        "https://example.com",
+		"Access-Control-Request-Method": "DELETE",
+	})
+	check("S3 CORS non-matching method → 403", err, err == nil && status == 403)
+
+	_, hdrs, err = raw("GET", "/"+objectKey, map[string]string{"Origin": "https://example.com"})
+	check("S3 CORS actual GET matching specific origin → echoes origin", err,
+		err == nil && hdrs.Get("Access-Control-Allow-Origin") == "https://example.com")
+
+	_, hdrs, err = raw("GET", "/"+objectKey, map[string]string{"Origin": "https://not-allowed.com"})
+	check("S3 CORS actual GET non-matching origin → no Allow-Origin", err,
+		err == nil && hdrs.Get("Access-Control-Allow-Origin") == "")
+
+	// ── DeleteBucketCors → preflights return 403 again ────────────────────────
+	_, err = svc.DeleteBucketCors(ctx, &s3.DeleteBucketCorsInput{Bucket: aws.String(bucket)})
+	check("S3 CORS DeleteBucketCors", err)
+
+	status, _, err = raw("OPTIONS", "/"+objectKey, map[string]string{
+		"Origin":                        "http://localhost:3000",
+		"Access-Control-Request-Method": "GET",
+	})
+	check("S3 CORS preflight after delete → 403", err, err == nil && status == 403)
+
+	// ── Subdomain wildcard origin pattern ─────────────────────────────────────
+	maxAge120 := int32(120)
+	_, err = svc.PutBucketCors(ctx, &s3.PutBucketCorsInput{
+		Bucket: aws.String(bucket),
+		CORSConfiguration: &s3types.CORSConfiguration{
+			CORSRules: []s3types.CORSRule{
+				{
+					AllowedOrigins: []string{"http://*.example.com"},
+					AllowedMethods: []string{"GET"},
+					AllowedHeaders: []string{"*"},
+					MaxAgeSeconds:  &maxAge120,
+				},
+			},
+		},
+	})
+	check("S3 CORS PutBucketCors (subdomain wildcard)", err)
+
+	status, hdrs, err = raw("OPTIONS", "/"+objectKey, map[string]string{
+		"Origin":                        "http://app.example.com",
+		"Access-Control-Request-Method": "GET",
+	})
+	check("S3 CORS subdomain wildcard matches http://app.example.com → 200", err,
+		err == nil && status == 200)
+	check("S3 CORS subdomain wildcard echoes matched origin", err,
+		err == nil && hdrs.Get("Access-Control-Allow-Origin") == "http://app.example.com")
+
+	status, _, err = raw("OPTIONS", "/"+objectKey, map[string]string{
+		"Origin":                        "https://app.example.com",
+		"Access-Control-Request-Method": "GET",
+	})
+	check("S3 CORS subdomain wildcard rejects https:// → 403", err, err == nil && status == 403)
+
+	status, _, err = raw("OPTIONS", "/"+objectKey, map[string]string{
+		"Origin":                        "http://app.other.com",
+		"Access-Control-Request-Method": "GET",
+	})
+	check("S3 CORS subdomain wildcard rejects different domain → 403", err, err == nil && status == 403)
+
+	// ── Cleanup ────────────────────────────────────────────────────────────────
+	svc.DeleteBucketCors(ctx, &s3.DeleteBucketCorsInput{Bucket: aws.String(bucket)})
+	svc.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String(objectKey)})
+	_, err = svc.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: aws.String(bucket)})
+	check("S3 CORS cleanup DeleteBucket", err)
 }
 
 // ── DynamoDB ──────────────────────────────────────────────────────────────────
@@ -757,6 +980,128 @@ func resolveEnabled(args []string) map[string]bool {
 	return m
 }
 
+// ── S3 Notification Filter ────────────────────────────────────────────────────
+
+func runS3Notifications(cfg aws.Config) {
+	fmt.Println("--- S3 Notification Filter Tests ---")
+
+	s3Svc := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		o.UsePathStyle = true
+	})
+	sqsSvc := sqs.NewFromConfig(cfg)
+	snsSvc := sns.NewFromConfig(cfg)
+
+	queueName := "s3-notif-filter-queue"
+	topicName := "s3-notif-filter-topic"
+	bucketName := "s3-notif-filter-bucket"
+
+	// Create SQS queue
+	_, err := sqsSvc.CreateQueue(ctx, &sqs.CreateQueueInput{QueueName: aws.String(queueName)})
+	check("S3Notif CreateQueue", err)
+	if err != nil {
+		return
+	}
+	queueArn := "arn:aws:sqs:us-east-1:000000000000:" + queueName
+
+	// Create SNS topic
+	ct, err := snsSvc.CreateTopic(ctx, &sns.CreateTopicInput{Name: aws.String(topicName)})
+	check("S3Notif CreateTopic", err)
+	if err != nil {
+		return
+	}
+	topicArn := aws.ToString(ct.TopicArn)
+
+	// Create S3 bucket
+	_, err = s3Svc.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucketName)})
+	check("S3Notif CreateBucket", err)
+	if err != nil {
+		return
+	}
+
+	// PutBucketNotificationConfiguration
+	_, err = s3Svc.PutBucketNotificationConfiguration(ctx, &s3.PutBucketNotificationConfigurationInput{
+		Bucket: aws.String(bucketName),
+		NotificationConfiguration: &s3types.NotificationConfiguration{
+			QueueConfigurations: []s3types.QueueConfiguration{
+				{
+					Id:       aws.String("sqs-filtered"),
+					QueueArn: aws.String(queueArn),
+					Events:   []s3types.Event{s3types.EventS3ObjectCreated},
+					Filter: &s3types.NotificationConfigurationFilter{
+						Key: &s3types.S3KeyFilter{
+							FilterRules: []s3types.FilterRule{
+								{Name: s3types.FilterRuleNamePrefix, Value: aws.String("incoming/")},
+								{Name: s3types.FilterRuleNameSuffix, Value: aws.String(".csv")},
+							},
+						},
+					},
+				},
+			},
+			TopicConfigurations: []s3types.TopicConfiguration{
+				{
+					Id:       aws.String("sns-filtered"),
+					TopicArn: aws.String(topicArn),
+					Events:   []s3types.Event{s3types.EventS3ObjectRemoved},
+					Filter: &s3types.NotificationConfigurationFilter{
+						Key: &s3types.S3KeyFilter{
+							FilterRules: []s3types.FilterRule{
+								{Name: s3types.FilterRuleNamePrefix, Value: aws.String("")},
+								{Name: s3types.FilterRuleNameSuffix, Value: aws.String(".txt")},
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+	check("S3Notif PutBucketNotificationConfiguration", err)
+	if err != nil {
+		return
+	}
+
+	// GetBucketNotificationConfiguration and assert
+	gnc, err := s3Svc.GetBucketNotificationConfiguration(ctx, &s3.GetBucketNotificationConfigurationInput{
+		Bucket: aws.String(bucketName),
+	})
+	check("S3Notif GetBucketNotificationConfiguration", err)
+	if err != nil {
+		return
+	}
+
+	// Assert queue config
+	check("S3Notif QueueConfig present",
+		nil,
+		len(gnc.QueueConfigurations) > 0 && aws.ToString(gnc.QueueConfigurations[0].QueueArn) == queueArn,
+	)
+	check("S3Notif QueueConfig has 2 filter rules",
+		nil,
+		len(gnc.QueueConfigurations) > 0 &&
+			gnc.QueueConfigurations[0].Filter != nil &&
+			gnc.QueueConfigurations[0].Filter.Key != nil &&
+			len(gnc.QueueConfigurations[0].Filter.Key.FilterRules) == 2,
+	)
+
+	// Assert topic config
+	check("S3Notif TopicConfig present",
+		nil,
+		len(gnc.TopicConfigurations) > 0 && aws.ToString(gnc.TopicConfigurations[0].TopicArn) == topicArn,
+	)
+	check("S3Notif TopicConfig has 2 filter rules",
+		nil,
+		len(gnc.TopicConfigurations) > 0 &&
+			gnc.TopicConfigurations[0].Filter != nil &&
+			gnc.TopicConfigurations[0].Filter.Key != nil &&
+			len(gnc.TopicConfigurations[0].Filter.Key.FilterRules) == 2,
+	)
+
+	// Cleanup
+	s3Svc.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: aws.String(bucketName)})
+	sqsSvc.DeleteQueue(ctx, &sqs.DeleteQueueInput{
+		QueueUrl: aws.String("http://localhost:4566/000000000000/" + queueName),
+	})
+	snsSvc.DeleteTopic(ctx, &sns.DeleteTopicInput{TopicArn: aws.String(topicArn)})
+}
+
 func main() {
 	endpoint := os.Getenv("FLOCI_ENDPOINT")
 	if endpoint == "" {
@@ -776,6 +1121,7 @@ func main() {
 		{"sqs", runSQS},
 		{"sns", runSNS},
 		{"s3", runS3},
+		{"s3-cors", runS3Cors},
 		{"dynamodb", runDynamoDB},
 		{"lambda", runLambda},
 		{"iam", runIAM},
@@ -784,6 +1130,7 @@ func main() {
 		{"kms", runKMS},
 		{"kinesis", runKinesis},
 		{"cloudwatch", runCloudWatch},
+		{"s3-notifications", runS3Notifications},
 	}
 
 	enabled := resolveEnabled(os.Args[1:])

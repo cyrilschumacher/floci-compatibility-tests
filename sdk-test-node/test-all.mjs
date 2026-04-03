@@ -9,9 +9,9 @@
  */
 
 import { SSMClient, PutParameterCommand, GetParameterCommand, DeleteParameterCommand, GetParametersByPathCommand, DescribeParametersCommand } from "@aws-sdk/client-ssm";
-import { SQSClient, CreateQueueCommand, SendMessageCommand, ReceiveMessageCommand, DeleteMessageCommand, GetQueueAttributesCommand, DeleteQueueCommand, SendMessageBatchCommand, SetQueueAttributesCommand } from "@aws-sdk/client-sqs";
+import { SQSClient, CreateQueueCommand, GetQueueUrlCommand, SendMessageCommand, ReceiveMessageCommand, DeleteMessageCommand, GetQueueAttributesCommand, DeleteQueueCommand, SendMessageBatchCommand, SetQueueAttributesCommand } from "@aws-sdk/client-sqs";
 import { SNSClient, CreateTopicCommand, SubscribeCommand, PublishCommand, ListTopicsCommand, ListSubscriptionsByTopicCommand, UnsubscribeCommand, DeleteTopicCommand, GetSubscriptionAttributesCommand, SetSubscriptionAttributesCommand, PublishBatchCommand } from "@aws-sdk/client-sns";
-import { S3Client, CreateBucketCommand, PutObjectCommand, GetObjectCommand, DeleteObjectCommand, ListObjectsV2Command, DeleteBucketCommand, HeadObjectCommand, HeadBucketCommand, ListBucketsCommand, CopyObjectCommand, GetBucketLocationCommand } from "@aws-sdk/client-s3";
+import { S3Client, CreateBucketCommand, PutObjectCommand, GetObjectCommand, DeleteObjectCommand, ListObjectsV2Command, DeleteBucketCommand, HeadObjectCommand, HeadBucketCommand, ListBucketsCommand, CopyObjectCommand, GetBucketLocationCommand, PutBucketNotificationConfigurationCommand, GetBucketNotificationConfigurationCommand, PutBucketCorsCommand, DeleteBucketCorsCommand } from "@aws-sdk/client-s3";
 import { DynamoDBClient, CreateTableCommand, PutItemCommand, GetItemCommand, DeleteItemCommand, ScanCommand, QueryCommand, UpdateItemCommand, DeleteTableCommand, ListTablesCommand, DescribeTableCommand } from "@aws-sdk/client-dynamodb";
 import { LambdaClient, CreateFunctionCommand, GetFunctionCommand, ListFunctionsCommand, DeleteFunctionCommand, CreateAliasCommand, GetAliasCommand, ListAliasesCommand, UpdateAliasCommand, DeleteAliasCommand, PublishVersionCommand } from "@aws-sdk/client-lambda";
 import { IAMClient, CreateRoleCommand, GetRoleCommand, DeleteRoleCommand, ListRolesCommand, CreatePolicyCommand, DeletePolicyCommand, AttachRolePolicyCommand, DetachRolePolicyCommand } from "@aws-sdk/client-iam";
@@ -268,6 +268,11 @@ async function testSqs() {
     const r = await sqs.send(new CreateQueueCommand({ QueueName: "floci-node-test" }));
     queueUrl = r.QueueUrl;
     check("Queue URL returned", !!queueUrl);
+  });
+
+  await tryOk("GetQueueUrl", async () => {
+    const r = await sqs.send(new GetQueueUrlCommand({ QueueName: "floci-node-test" }));
+    check("GetQueueUrl matches CreateQueue", r.QueueUrl === queueUrl);
   });
 
   await tryOk("GetQueueAttributes", async () => {
@@ -528,6 +533,206 @@ async function testS3() {
 
   await tryFail("GetObject missing", () =>
     s3.send(new GetObjectCommand({ Bucket: bucket, Key: "missing.txt" })));
+}
+
+// ─────────────────────────── S3 CORS ───────────────────────────
+async function testS3Cors() {
+  console.log("\n=== S3 CORS Enforcement ===");
+  const s3 = makeClient(S3Client, { forcePathStyle: true });
+  const bucket = `floci-node-cors-${Date.now()}`;
+
+  /** Raw HTTP helper: returns { status, headers } where headers is a plain object with lowercase keys. */
+  async function raw(method, path, extraHeaders = {}) {
+    const url = `${ENDPOINT}/${bucket}${path}`;
+    const resp = await fetch(url, { method, headers: extraHeaders });
+    const headers = {};
+    resp.headers.forEach((v, k) => { headers[k.toLowerCase()] = v; });
+    return { status: resp.status, headers };
+  }
+
+  // ── Setup ─────────────────────────────────────────────────────────────────
+  await tryOk("S3 CORS setup (create bucket + object)", async () => {
+    await s3.send(new CreateBucketCommand({ Bucket: bucket }));
+    await s3.send(new PutObjectCommand({ Bucket: bucket, Key: "cors-test.txt", Body: "hello cors" }));
+  });
+
+  // ── No CORS config: preflight → 403 ──────────────────────────────────────
+  await tryOk("S3 CORS preflight without config", async () => {
+    const { status } = await raw("OPTIONS", "/cors-test.txt", {
+      "Origin": "http://localhost:3000",
+      "Access-Control-Request-Method": "GET",
+    });
+    check("S3 CORS preflight without config → 403", status === 403);
+  });
+
+  // ── Wildcard-origin CORS config ───────────────────────────────────────────
+  await tryOk("S3 CORS PutBucketCors (wildcard)", () =>
+    s3.send(new PutBucketCorsCommand({
+      Bucket: bucket,
+      CORSConfiguration: {
+        CORSRules: [{
+          AllowedOrigins: ["*"],
+          AllowedMethods: ["GET", "PUT", "POST", "DELETE", "HEAD"],
+          AllowedHeaders: ["*"],
+          ExposeHeaders: ["ETag"],
+          MaxAgeSeconds: 3000,
+        }],
+      },
+    }))
+  );
+
+  await tryOk("S3 CORS wildcard preflight", async () => {
+    const { status, headers } = await raw("OPTIONS", "/cors-test.txt", {
+      "Origin": "http://localhost:3000",
+      "Access-Control-Request-Method": "GET",
+    });
+    check("S3 CORS wildcard preflight → 200", status === 200);
+    check("S3 CORS wildcard preflight → Allow-Origin: *",
+      headers["access-control-allow-origin"] === "*");
+    check("S3 CORS wildcard preflight → Max-Age: 3000",
+      headers["access-control-max-age"] === "3000");
+    check("S3 CORS wildcard preflight → Allow-Methods contains GET",
+      (headers["access-control-allow-methods"] || "").toUpperCase().includes("GET"));
+  });
+
+  await tryOk("S3 CORS actual GET with Origin (wildcard config)", async () => {
+    const { headers } = await raw("GET", "/cors-test.txt", { "Origin": "http://localhost:3000" });
+    check("S3 CORS actual GET → Allow-Origin: *",
+      headers["access-control-allow-origin"] === "*");
+    const vary = headers["vary"] || "";
+    check("S3 CORS actual GET → Vary: Origin",
+      vary.split(",").map(s => s.trim().toLowerCase()).includes("origin"));
+    check("S3 CORS actual GET → Expose-Headers contains ETag",
+      (headers["access-control-expose-headers"] || "").includes("ETag"));
+  });
+
+  await tryOk("S3 CORS actual GET without Origin (wildcard config)", async () => {
+    const { headers } = await raw("GET", "/cors-test.txt");
+    check("S3 CORS actual GET (no Origin) → no Allow-Origin",
+      !headers["access-control-allow-origin"]);
+  });
+
+  await tryOk("S3 CORS OPTIONS without Origin (wildcard config)", async () => {
+    const { headers } = await raw("OPTIONS", "/cors-test.txt");
+    check("S3 CORS OPTIONS without Origin → no Allow-Origin",
+      !headers["access-control-allow-origin"]);
+  });
+
+  // ── Specific-origin CORS config ───────────────────────────────────────────
+  await tryOk("S3 CORS PutBucketCors (specific origin)", () =>
+    s3.send(new PutBucketCorsCommand({
+      Bucket: bucket,
+      CORSConfiguration: {
+        CORSRules: [{
+          AllowedOrigins: ["https://example.com"],
+          AllowedMethods: ["GET", "PUT"],
+          AllowedHeaders: ["Content-Type", "Authorization"],
+          ExposeHeaders: ["ETag", "x-amz-request-id"],
+          MaxAgeSeconds: 600,
+        }],
+      },
+    }))
+  );
+
+  await tryOk("S3 CORS specific origin preflight matching", async () => {
+    const { status, headers } = await raw("OPTIONS", "/cors-test.txt", {
+      "Origin": "https://example.com",
+      "Access-Control-Request-Method": "GET",
+      "Access-Control-Request-Headers": "Content-Type",
+    });
+    check("S3 CORS specific origin preflight → 200", status === 200);
+    check("S3 CORS specific origin preflight → echoes origin",
+      headers["access-control-allow-origin"] === "https://example.com");
+    check("S3 CORS specific origin preflight → Max-Age: 600",
+      headers["access-control-max-age"] === "600");
+  });
+
+  await tryOk("S3 CORS non-matching origin", async () => {
+    const { status } = await raw("OPTIONS", "/cors-test.txt", {
+      "Origin": "https://attacker.evil.com",
+      "Access-Control-Request-Method": "GET",
+    });
+    check("S3 CORS non-matching origin → 403", status === 403);
+  });
+
+  await tryOk("S3 CORS non-matching method", async () => {
+    const { status } = await raw("OPTIONS", "/cors-test.txt", {
+      "Origin": "https://example.com",
+      "Access-Control-Request-Method": "DELETE",
+    });
+    check("S3 CORS non-matching method → 403", status === 403);
+  });
+
+  await tryOk("S3 CORS actual GET matching specific origin", async () => {
+    const { headers } = await raw("GET", "/cors-test.txt", { "Origin": "https://example.com" });
+    check("S3 CORS actual GET matching specific origin → echoes origin",
+      headers["access-control-allow-origin"] === "https://example.com");
+  });
+
+  await tryOk("S3 CORS actual GET non-matching origin", async () => {
+    const { headers } = await raw("GET", "/cors-test.txt", { "Origin": "https://not-allowed.com" });
+    check("S3 CORS actual GET non-matching origin → no Allow-Origin",
+      !headers["access-control-allow-origin"]);
+  });
+
+  // ── DeleteBucketCors → preflights return 403 again ────────────────────────
+  await tryOk("S3 CORS DeleteBucketCors", () =>
+    s3.send(new DeleteBucketCorsCommand({ Bucket: bucket }))
+  );
+
+  await tryOk("S3 CORS preflight after delete", async () => {
+    const { status } = await raw("OPTIONS", "/cors-test.txt", {
+      "Origin": "http://localhost:3000",
+      "Access-Control-Request-Method": "GET",
+    });
+    check("S3 CORS preflight after delete → 403", status === 403);
+  });
+
+  // ── Subdomain wildcard origin pattern ─────────────────────────────────────
+  await tryOk("S3 CORS PutBucketCors (subdomain wildcard)", () =>
+    s3.send(new PutBucketCorsCommand({
+      Bucket: bucket,
+      CORSConfiguration: {
+        CORSRules: [{
+          AllowedOrigins: ["http://*.example.com"],
+          AllowedMethods: ["GET"],
+          AllowedHeaders: ["*"],
+          MaxAgeSeconds: 120,
+        }],
+      },
+    }))
+  );
+
+  await tryOk("S3 CORS subdomain wildcard matching", async () => {
+    const { status, headers } = await raw("OPTIONS", "/cors-test.txt", {
+      "Origin": "http://app.example.com",
+      "Access-Control-Request-Method": "GET",
+    });
+    check("S3 CORS subdomain wildcard matches http://app.example.com → 200", status === 200);
+    check("S3 CORS subdomain wildcard echoes matched origin",
+      headers["access-control-allow-origin"] === "http://app.example.com");
+  });
+
+  await tryOk("S3 CORS subdomain wildcard rejects https", async () => {
+    const { status } = await raw("OPTIONS", "/cors-test.txt", {
+      "Origin": "https://app.example.com",
+      "Access-Control-Request-Method": "GET",
+    });
+    check("S3 CORS subdomain wildcard rejects https://app.example.com → 403", status === 403);
+  });
+
+  await tryOk("S3 CORS subdomain wildcard rejects different domain", async () => {
+    const { status } = await raw("OPTIONS", "/cors-test.txt", {
+      "Origin": "http://app.other.com",
+      "Access-Control-Request-Method": "GET",
+    });
+    check("S3 CORS subdomain wildcard rejects http://app.other.com → 403", status === 403);
+  });
+
+  // ── Cleanup ────────────────────────────────────────────────────────────────
+  try { await s3.send(new DeleteBucketCorsCommand({ Bucket: bucket })); } catch (_) {}
+  try { await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: "cors-test.txt" })); } catch (_) {}
+  try { await s3.send(new DeleteBucketCommand({ Bucket: bucket })); } catch (_) {}
 }
 
 // ─────────────────────────── DynamoDB ───────────────────────────
@@ -1721,12 +1926,107 @@ async function testCloudFormationNaming() {
   await deleteStack(explicitStack, "CFN Naming explicit DeleteStack");
 }
 
+// ─────────────────────────── S3 Notifications ───────────────────────────
+async function testS3Notifications() {
+  console.log("\n=== S3 Notifications ===");
+  const s3 = makeClient(S3Client, { forcePathStyle: true });
+  const sqs = makeClient(SQSClient);
+  const sns = makeClient(SNSClient);
+
+  const prefix = "s3-notif-filter-";
+  const bucketName = `${prefix}bucket`;
+  const queueName = `${prefix}queue`;
+  const topicName = `${prefix}topic`;
+
+  let queueUrl, queueArn, topicArn;
+
+  await tryOk("CreateQueue for S3 notifications", async () => {
+    const r = await sqs.send(new CreateQueueCommand({ QueueName: queueName }));
+    queueUrl = r.QueueUrl;
+    const attrs = await sqs.send(new GetQueueAttributesCommand({ QueueUrl: queueUrl, AttributeNames: ["QueueArn"] }));
+    queueArn = attrs.Attributes.QueueArn;
+    check("QueueArn present", !!queueArn);
+  });
+
+  await tryOk("CreateTopic for S3 notifications", async () => {
+    const r = await sns.send(new CreateTopicCommand({ Name: topicName }));
+    topicArn = r.TopicArn;
+    check("TopicArn present", !!topicArn);
+  });
+
+  await tryOk("CreateBucket for S3 notifications", async () => {
+    await s3.send(new CreateBucketCommand({ Bucket: bucketName }));
+  });
+
+  await tryOk("PutBucketNotificationConfiguration", async () => {
+    await s3.send(new PutBucketNotificationConfigurationCommand({
+      Bucket: bucketName,
+      NotificationConfiguration: {
+        QueueConfigurations: [
+          {
+            Id: "sqs-filtered",
+            QueueArn: queueArn,
+            Events: ["s3:ObjectCreated:*"],
+            Filter: {
+              Key: {
+                FilterRules: [
+                  { Name: "prefix", Value: "incoming/" },
+                  { Name: "suffix", Value: ".csv" },
+                ],
+              },
+            },
+          },
+        ],
+        TopicConfigurations: [
+          {
+            Id: "sns-filtered",
+            TopicArn: topicArn,
+            Events: ["s3:ObjectRemoved:*"],
+            Filter: {
+              Key: {
+                FilterRules: [
+                  { Name: "prefix", Value: "" },
+                  { Name: "suffix", Value: ".txt" },
+                ],
+              },
+            },
+          },
+        ],
+      },
+    }));
+  });
+
+  await tryOk("GetBucketNotificationConfiguration", async () => {
+    const r = await s3.send(new GetBucketNotificationConfigurationCommand({ Bucket: bucketName }));
+
+    const queueConfigs = r.QueueConfigurations || [];
+    const sqsEntry = queueConfigs.find(c => c.QueueArn === queueArn);
+    check("QueueConfiguration entry found", !!sqsEntry);
+    check("QueueConfiguration has 2 filter rules", (sqsEntry?.Filter?.Key?.FilterRules || []).length === 2);
+
+    const topicConfigs = r.TopicConfigurations || [];
+    const snsEntry = topicConfigs.find(c => c.TopicArn === topicArn);
+    check("TopicConfiguration entry found", !!snsEntry);
+    check("TopicConfiguration has 2 filter rules", (snsEntry?.Filter?.Key?.FilterRules || []).length === 2);
+  });
+
+  await tryOk("DeleteBucket S3 notifications", () =>
+    s3.send(new DeleteBucketCommand({ Bucket: bucketName })));
+
+  await tryOk("DeleteQueue S3 notifications", () =>
+    sqs.send(new DeleteQueueCommand({ QueueUrl: queueUrl })));
+
+  await tryOk("DeleteTopic S3 notifications", () =>
+    sns.send(new DeleteTopicCommand({ TopicArn: topicArn })));
+}
+
 // ─────────────────────────── Runner ───────────────────────────
 const ALL_SUITES = {
   ssm: testSsm,
   sqs: testSqs,
   sns: testSns,
   s3: testS3,
+  "s3-cors": testS3Cors,
   dynamodb: testDynamoDb,
   "dynamodb-gsi": testDynamoDbGsi,
   lambda: testLambda,
@@ -1739,6 +2039,7 @@ const ALL_SUITES = {
   "cloudformation-naming": testCloudFormationNaming,
   cognito: testCognito,
   "cognito-oauth": testCognitoOAuth,
+  "s3-notifications": testS3Notifications,
 };
 
 async function main() {

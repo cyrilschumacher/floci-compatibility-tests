@@ -192,6 +192,12 @@ def run_sqs():
         return
 
     try:
+        r = sqs.get_queue_url(QueueName="py-sdk-test-queue")
+        check("SQS GetQueueUrl", r.get("QueueUrl") == queue_url)
+    except Exception as e:
+        check("SQS GetQueueUrl", False, e)
+
+    try:
         r = sqs.list_queues(QueueNamePrefix="py-sdk-test-queue")
         check("SQS ListQueues", any("py-sdk-test-queue" in u for u in r.get("QueueUrls", [])))
     except Exception as e:
@@ -2113,6 +2119,382 @@ def run_cloudformation_naming():
     delete_stack(explicit_stack, "CFN Naming explicit DeleteStack")
 
 
+def run_s3_cors():
+    import urllib.request
+    import urllib.error
+
+    print("--- S3 CORS Enforcement Tests ---")
+    s3 = client("s3")
+    bucket = "py-sdk-cors-test-" + str(int(time.time()))
+
+    def raw(method, path, headers=None):
+        """Makes a raw HTTP request; returns (status_code, lowercase_headers_dict)."""
+        url = f"{ENDPOINT}/{bucket}{path}"
+        req = urllib.request.Request(url, method=method)
+        if headers:
+            for k, v in headers.items():
+                req.add_header(k, v)
+        try:
+            with urllib.request.urlopen(req) as resp:
+                return resp.status, {k.lower(): v for k, v in resp.headers.items()}
+        except urllib.error.HTTPError as e:
+            return e.code, {k.lower(): v for k, v in e.headers.items()}
+
+    # ── Setup ─────────────────────────────────────────────────────────────────
+    try:
+        s3.create_bucket(Bucket=bucket)
+        s3.put_object(Bucket=bucket, Key="cors-test.txt", Body=b"hello cors",
+                      ContentType="text/plain")
+        check("S3 CORS setup (create bucket + object)", True)
+    except Exception as e:
+        check("S3 CORS setup (create bucket + object)", False, e)
+        return
+
+    # ── No CORS config: preflight → 403 ──────────────────────────────────────
+    try:
+        status, _ = raw("OPTIONS", "/cors-test.txt", {
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "GET",
+        })
+        check("S3 CORS preflight without config → 403", status == 403)
+    except Exception as e:
+        check("S3 CORS preflight without config → 403", False, e)
+
+    # ── Wildcard-origin CORS config ───────────────────────────────────────────
+    try:
+        s3.put_bucket_cors(
+            Bucket=bucket,
+            CORSConfiguration={
+                "CORSRules": [{
+                    "AllowedOrigins": ["*"],
+                    "AllowedMethods": ["GET", "PUT", "POST", "DELETE", "HEAD"],
+                    "AllowedHeaders": ["*"],
+                    "ExposeHeaders": ["ETag"],
+                    "MaxAgeSeconds": 3000,
+                }]
+            },
+        )
+        check("S3 CORS PutBucketCors (wildcard)", True)
+    except Exception as e:
+        check("S3 CORS PutBucketCors (wildcard)", False, e)
+
+    try:
+        status, headers = raw("OPTIONS", "/cors-test.txt", {
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "GET",
+        })
+        check("S3 CORS wildcard preflight → 200", status == 200)
+        check("S3 CORS wildcard preflight → Allow-Origin: *",
+              headers.get("access-control-allow-origin") == "*")
+        check("S3 CORS wildcard preflight → Max-Age: 3000",
+              headers.get("access-control-max-age") == "3000")
+        check("S3 CORS wildcard preflight → Allow-Methods contains GET",
+              "GET" in headers.get("access-control-allow-methods", "").upper())
+    except Exception as e:
+        check("S3 CORS wildcard preflight → 200", False, e)
+
+    # Actual GET with Origin → receives CORS response headers
+    try:
+        status, headers = raw("GET", "/cors-test.txt", {"Origin": "http://localhost:3000"})
+        check("S3 CORS actual GET → Allow-Origin: *",
+              headers.get("access-control-allow-origin") == "*")
+        vary = headers.get("vary", "")
+        check("S3 CORS actual GET → Vary: Origin",
+              any(t.strip().lower() == "origin" for t in vary.split(",")))
+        check("S3 CORS actual GET → Expose-Headers contains ETag",
+              "ETag" in headers.get("access-control-expose-headers", ""))
+    except Exception as e:
+        check("S3 CORS actual GET → Allow-Origin: *", False, e)
+
+    # Actual GET without Origin header → no CORS headers
+    try:
+        _, headers = raw("GET", "/cors-test.txt")
+        check("S3 CORS actual GET (no Origin) → no Allow-Origin",
+              "access-control-allow-origin" not in headers)
+    except Exception as e:
+        check("S3 CORS actual GET (no Origin) → no Allow-Origin", False, e)
+
+    # OPTIONS without Origin header → no CORS headers
+    try:
+        _, headers = raw("OPTIONS", "/cors-test.txt")
+        check("S3 CORS OPTIONS without Origin → no Allow-Origin",
+              "access-control-allow-origin" not in headers)
+    except Exception as e:
+        check("S3 CORS OPTIONS without Origin → no Allow-Origin", False, e)
+
+    # ── Specific-origin CORS config ───────────────────────────────────────────
+    try:
+        s3.put_bucket_cors(
+            Bucket=bucket,
+            CORSConfiguration={
+                "CORSRules": [{
+                    "AllowedOrigins": ["https://example.com"],
+                    "AllowedMethods": ["GET", "PUT"],
+                    "AllowedHeaders": ["Content-Type", "Authorization"],
+                    "ExposeHeaders": ["ETag", "x-amz-request-id"],
+                    "MaxAgeSeconds": 600,
+                }]
+            },
+        )
+        check("S3 CORS PutBucketCors (specific origin)", True)
+    except Exception as e:
+        check("S3 CORS PutBucketCors (specific origin)", False, e)
+
+    try:
+        status, headers = raw("OPTIONS", "/cors-test.txt", {
+            "Origin": "https://example.com",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "Content-Type",
+        })
+        check("S3 CORS specific origin preflight → 200", status == 200)
+        check("S3 CORS specific origin preflight → echoes origin",
+              headers.get("access-control-allow-origin") == "https://example.com")
+        check("S3 CORS specific origin preflight → Max-Age: 600",
+              headers.get("access-control-max-age") == "600")
+    except Exception as e:
+        check("S3 CORS specific origin preflight → 200", False, e)
+
+    try:
+        status, _ = raw("OPTIONS", "/cors-test.txt", {
+            "Origin": "https://attacker.evil.com",
+            "Access-Control-Request-Method": "GET",
+        })
+        check("S3 CORS non-matching origin → 403", status == 403)
+    except Exception as e:
+        check("S3 CORS non-matching origin → 403", False, e)
+
+    try:
+        status, _ = raw("OPTIONS", "/cors-test.txt", {
+            "Origin": "https://example.com",
+            "Access-Control-Request-Method": "DELETE",
+        })
+        check("S3 CORS non-matching method → 403", status == 403)
+    except Exception as e:
+        check("S3 CORS non-matching method → 403", False, e)
+
+    try:
+        _, headers = raw("GET", "/cors-test.txt", {"Origin": "https://example.com"})
+        check("S3 CORS actual GET matching specific origin → echoes origin",
+              headers.get("access-control-allow-origin") == "https://example.com")
+    except Exception as e:
+        check("S3 CORS actual GET matching specific origin → echoes origin", False, e)
+
+    try:
+        _, headers = raw("GET", "/cors-test.txt", {"Origin": "https://not-allowed.com"})
+        check("S3 CORS actual GET non-matching origin → no Allow-Origin",
+              "access-control-allow-origin" not in headers)
+    except Exception as e:
+        check("S3 CORS actual GET non-matching origin → no Allow-Origin", False, e)
+
+    # ── DeleteBucketCors → preflights return 403 again ────────────────────────
+    try:
+        s3.delete_bucket_cors(Bucket=bucket)
+        check("S3 CORS DeleteBucketCors", True)
+    except Exception as e:
+        check("S3 CORS DeleteBucketCors", False, e)
+
+    try:
+        status, _ = raw("OPTIONS", "/cors-test.txt", {
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "GET",
+        })
+        check("S3 CORS preflight after delete → 403", status == 403)
+    except Exception as e:
+        check("S3 CORS preflight after delete → 403", False, e)
+
+    # ── Subdomain wildcard origin pattern ─────────────────────────────────────
+    try:
+        s3.put_bucket_cors(
+            Bucket=bucket,
+            CORSConfiguration={
+                "CORSRules": [{
+                    "AllowedOrigins": ["http://*.example.com"],
+                    "AllowedMethods": ["GET"],
+                    "AllowedHeaders": ["*"],
+                    "MaxAgeSeconds": 120,
+                }]
+            },
+        )
+        check("S3 CORS PutBucketCors (subdomain wildcard)", True)
+    except Exception as e:
+        check("S3 CORS PutBucketCors (subdomain wildcard)", False, e)
+
+    try:
+        status, headers = raw("OPTIONS", "/cors-test.txt", {
+            "Origin": "http://app.example.com",
+            "Access-Control-Request-Method": "GET",
+        })
+        check("S3 CORS subdomain wildcard matches http://app.example.com",
+              status == 200 and
+              headers.get("access-control-allow-origin") == "http://app.example.com")
+    except Exception as e:
+        check("S3 CORS subdomain wildcard matches http://app.example.com", False, e)
+
+    try:
+        status, _ = raw("OPTIONS", "/cors-test.txt", {
+            "Origin": "https://app.example.com",
+            "Access-Control-Request-Method": "GET",
+        })
+        check("S3 CORS subdomain wildcard rejects https:// → 403", status == 403)
+    except Exception as e:
+        check("S3 CORS subdomain wildcard rejects https:// → 403", False, e)
+
+    try:
+        status, _ = raw("OPTIONS", "/cors-test.txt", {
+            "Origin": "http://app.other.com",
+            "Access-Control-Request-Method": "GET",
+        })
+        check("S3 CORS subdomain wildcard rejects different domain → 403", status == 403)
+    except Exception as e:
+        check("S3 CORS subdomain wildcard rejects different domain → 403", False, e)
+
+    # ── Cleanup ────────────────────────────────────────────────────────────────
+    try:
+        s3.delete_bucket_cors(Bucket=bucket)
+    except Exception:
+        pass
+    try:
+        s3.delete_object(Bucket=bucket, Key="cors-test.txt")
+        s3.delete_bucket(Bucket=bucket)
+    except Exception as e:
+        check("S3 CORS cleanup", False, e)
+
+
+# ---------------------------------------------------------------------------
+# S3 Notification Filter
+# ---------------------------------------------------------------------------
+
+def run_s3_notifications():
+    print("--- S3 Notification Filter Tests ---")
+    s3 = client("s3")
+    sqs = client("sqs")
+    sns = client("sns")
+
+    account_id = "000000000000"
+    prefix = "s3-notif-filter-"
+    queue_name = prefix + "queue"
+    topic_name = prefix + "topic"
+    bucket_name = prefix + "bucket"
+
+    queue_arn = f"arn:aws:sqs:us-east-1:{account_id}:{queue_name}"
+
+    # Create SQS queue
+    try:
+        sqs.create_queue(QueueName=queue_name)
+        check("S3 Notifications create SQS queue", True)
+    except Exception as e:
+        check("S3 Notifications create SQS queue", False, e)
+        return
+
+    # Create SNS topic
+    try:
+        r = sns.create_topic(Name=topic_name)
+        topic_arn = r["TopicArn"]
+        check("S3 Notifications create SNS topic", True)
+    except Exception as e:
+        check("S3 Notifications create SNS topic", False, e)
+        try:
+            sqs.delete_queue(QueueUrl=sqs.get_queue_url(QueueName=queue_name)["QueueUrl"])
+        except Exception:
+            pass
+        return
+
+    # Create S3 bucket
+    try:
+        s3.create_bucket(Bucket=bucket_name)
+        check("S3 Notifications create bucket", True)
+    except Exception as e:
+        check("S3 Notifications create bucket", False, e)
+        try:
+            sns.delete_topic(TopicArn=topic_arn)
+            sqs.delete_queue(QueueUrl=sqs.get_queue_url(QueueName=queue_name)["QueueUrl"])
+        except Exception:
+            pass
+        return
+
+    try:
+        # Put notification configuration with prefix/suffix filters
+        s3.put_bucket_notification_configuration(
+            Bucket=bucket_name,
+            NotificationConfiguration={
+                "QueueConfigurations": [
+                    {
+                        "Id": "sqs-filtered",
+                        "QueueArn": queue_arn,
+                        "Events": ["s3:ObjectCreated:*"],
+                        "Filter": {
+                            "Key": {
+                                "FilterRules": [
+                                    {"Name": "prefix", "Value": "incoming/"},
+                                    {"Name": "suffix", "Value": ".csv"},
+                                ]
+                            }
+                        },
+                    }
+                ],
+                "TopicConfigurations": [
+                    {
+                        "Id": "sns-filtered",
+                        "TopicArn": topic_arn,
+                        "Events": ["s3:ObjectRemoved:*"],
+                        "Filter": {
+                            "Key": {
+                                "FilterRules": [
+                                    {"Name": "prefix", "Value": ""},
+                                    {"Name": "suffix", "Value": ".txt"},
+                                ]
+                            }
+                        },
+                    }
+                ],
+            },
+        )
+        check("S3 Notifications put notification configuration", True)
+    except Exception as e:
+        check("S3 Notifications put notification configuration", False, e)
+        try:
+            s3.delete_bucket(Bucket=bucket_name)
+            sns.delete_topic(TopicArn=topic_arn)
+            sqs.delete_queue(QueueUrl=sqs.get_queue_url(QueueName=queue_name)["QueueUrl"])
+        except Exception:
+            pass
+        return
+
+    try:
+        r = s3.get_bucket_notification_configuration(Bucket=bucket_name)
+
+        queue_configs = r.get("QueueConfigurations", [])
+        sqs_entry = next((c for c in queue_configs if c.get("QueueArn") == queue_arn), None)
+        check("S3 Notifications SQS config present", sqs_entry is not None)
+        if sqs_entry is not None:
+            sqs_rules = sqs_entry.get("Filter", {}).get("Key", {}).get("FilterRules", [])
+            check("S3 Notifications SQS config has 2 filter rules", len(sqs_rules) == 2, sqs_rules)
+
+        topic_configs = r.get("TopicConfigurations", [])
+        sns_entry = next((c for c in topic_configs if c.get("TopicArn") == topic_arn), None)
+        check("S3 Notifications SNS config present", sns_entry is not None)
+        if sns_entry is not None:
+            sns_rules = sns_entry.get("Filter", {}).get("Key", {}).get("FilterRules", [])
+            check("S3 Notifications SNS config has 2 filter rules", len(sns_rules) == 2, sns_rules)
+
+    except Exception as e:
+        check("S3 Notifications get notification configuration", False, e)
+    finally:
+        try:
+            s3.delete_bucket(Bucket=bucket_name)
+        except Exception:
+            pass
+        try:
+            sns.delete_topic(TopicArn=topic_arn)
+        except Exception:
+            pass
+        try:
+            queue_url = sqs.get_queue_url(QueueName=queue_name)["QueueUrl"]
+            sqs.delete_queue(QueueUrl=queue_url)
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -2122,6 +2504,7 @@ ALL_GROUPS = [
     ("sqs", run_sqs),
     ("sns", run_sns),
     ("s3", run_s3),
+    ("s3-cors", run_s3_cors),
     ("dynamodb", run_dynamodb),
     ("dynamodb-gsi", run_dynamodb_gsi),
     ("lambda", run_lambda),
@@ -2133,6 +2516,7 @@ ALL_GROUPS = [
     ("cloudwatch-metrics", run_cloudwatch_metrics),
     ("cloudformation-naming", run_cloudformation_naming),
     ("cognito", run_cognito),
+    ("s3-notifications", run_s3_notifications),
 ]
 
 
